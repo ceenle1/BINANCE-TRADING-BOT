@@ -1,0 +1,285 @@
+"""Binance Spot bot: EMA crossover + RSI filter, with explicit testnet/live safeguards.
+
+Trading is disabled unless ENABLE_TRADING=1. Never put API secrets in this file.
+"""
+
+import hashlib
+import hmac
+import json
+import os
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from decimal import Decimal, ROUND_DOWN
+
+
+TESTNET_URL = "https://testnet.binance.vision"
+LIVE_URL = "https://api.binance.com"
+
+
+def env_bool(name, default=False):
+    return os.environ.get(name, "1" if default else "0").strip().lower() in (
+        "1", "true", "yes", "on"
+    )
+
+
+def http_json(url, api_key=None, method="GET", timeout=15):
+    headers = {}
+    if api_key:
+        headers["X-MBX-APIKEY"] = api_key
+    request = urllib.request.Request(url, data=b"" if method == "POST" else None,
+                                     headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", "replace")
+        raise RuntimeError("Binance HTTP {}: {}".format(error.code, detail))
+    except urllib.error.URLError as error:
+        raise RuntimeError("Binance connection error: {}".format(error))
+
+
+class BinanceSpot:
+    def __init__(self, base_url, api_key, api_secret):
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.api_secret = api_secret.encode("utf-8")
+
+    def public_get(self, path, params=None):
+        query = urllib.parse.urlencode(params or [])
+        url = self.base_url + path + ("?" + query if query else "")
+        return http_json(url)
+
+    def signed(self, method, path, params):
+        signed_params = list(params) + [
+            ("recvWindow", "5000"),
+            ("timestamp", str(int(time.time() * 1000)))
+        ]
+        query = urllib.parse.urlencode(signed_params)
+        signature = hmac.new(self.api_secret, query.encode("utf-8"),
+                             hashlib.sha256).hexdigest()
+        url = self.base_url + path + "?" + query + "&signature=" + signature
+        return http_json(url, api_key=self.api_key, method=method)
+
+    def account(self):
+        return self.signed("GET", "/api/v3/account", [])
+
+    def market_buy(self, symbol, quote_amount):
+        params = [
+            ("symbol", symbol),
+            ("side", "BUY"),
+            ("type", "MARKET"),
+            ("quoteOrderQty", str(quote_amount)),
+            ("newOrderRespType", "FULL")
+        ]
+        return self.signed("POST", "/api/v3/order", params)
+
+    def market_sell(self, symbol, quantity):
+        params = [
+            ("symbol", symbol),
+            ("side", "SELL"),
+            ("type", "MARKET"),
+            ("quantity", quantity),
+            ("newOrderRespType", "FULL")
+        ]
+        return self.signed("POST", "/api/v3/order", params)
+
+
+def ema(values, period):
+    result = [None] * len(values)
+    if len(values) < period:
+        return result
+    current = sum(values[:period]) / float(period)
+    result[period - 1] = current
+    multiplier = 2.0 / (period + 1.0)
+    for index in range(period, len(values)):
+        current = (values[index] - current) * multiplier + current
+        result[index] = current
+    return result
+
+
+def rsi(values, period=14):
+    result = [None] * len(values)
+    if len(values) <= period:
+        return result
+    changes = [values[i] - values[i - 1] for i in range(1, len(values))]
+    gains = [max(change, 0.0) for change in changes]
+    losses = [max(-change, 0.0) for change in changes]
+    average_gain = sum(gains[:period]) / float(period)
+    average_loss = sum(losses[:period]) / float(period)
+    result[period] = 100.0 if average_loss == 0 else (
+        100.0 - 100.0 / (1.0 + average_gain / average_loss)
+    )
+    for index in range(period + 1, len(values)):
+        change_index = index - 1
+        average_gain = (average_gain * (period - 1) + gains[change_index]) / period
+        average_loss = (average_loss * (period - 1) + losses[change_index]) / period
+        result[index] = 100.0 if average_loss == 0 else (
+            100.0 - 100.0 / (1.0 + average_gain / average_loss)
+        )
+    return result
+
+
+def load_state(path):
+    if not os.path.exists(path):
+        return {"last_candle": 0, "in_position": False,
+                "entry_price": 0.0, "quantity": 0.0}
+    with open(path, "r") as state_file:
+        state = json.load(state_file)
+    return state
+
+
+def save_state(path, state):
+    with open(path, "w") as state_file:
+        json.dump(state, state_file, indent=2)
+
+
+def decimal_floor(value, step):
+    value_decimal = Decimal(str(value))
+    step_decimal = Decimal(str(step))
+    floored = (value_decimal / step_decimal).to_integral_value(rounding=ROUND_DOWN)
+    return floored * step_decimal
+
+
+def format_decimal(value):
+    return format(value, "f")
+
+
+def average_fill_price(order, fallback_price):
+    fills = order.get("fills", [])
+    quantity = sum(float(fill["qty"]) for fill in fills)
+    if quantity:
+        return sum(float(fill["qty"]) * float(fill["price"]) for fill in fills) / quantity
+    return fallback_price
+
+
+def run_bot():
+    if not env_bool("ENABLE_TRADING"):
+        print("Trading is disabled. Set ENABLE_TRADING=1 to enable a bot cycle.")
+        return
+
+    base_url = os.environ.get("BINANCE_BASE_URL", TESTNET_URL).rstrip("/")
+    if base_url not in (TESTNET_URL, LIVE_URL):
+        raise RuntimeError("BINANCE_BASE_URL must be the Binance Spot Testnet or Spot API URL.")
+    if base_url == LIVE_URL and not env_bool("ALLOW_LIVE_TRADING"):
+        raise RuntimeError("Live endpoint selected; set ALLOW_LIVE_TRADING=1 only if you accept live-trading risk.")
+
+    api_key = os.environ.get("BINANCE_API_KEY", "")
+    api_secret = os.environ.get("BINANCE_API_SECRET", "")
+    if not api_key or not api_secret:
+        raise RuntimeError("Set BINANCE_API_KEY and BINANCE_API_SECRET in the environment.")
+
+    symbol = os.environ.get("BINANCE_SYMBOL", "BTCUSDT").upper()
+    interval = os.environ.get("BINANCE_INTERVAL", "1h")
+    quote_amount = Decimal(os.environ.get("QUOTE_ORDER_SIZE", "20"))
+    stop_loss = float(os.environ.get("STOP_LOSS_PERCENT", "2.0")) / 100.0
+    take_profit = float(os.environ.get("TAKE_PROFIT_PERCENT", "4.0")) / 100.0
+    state_path = os.environ.get("BOT_STATE_FILE", "bot_state.json")
+    poll_seconds = max(0, int(os.environ.get("POLL_SECONDS", "0")))
+
+    if quote_amount <= 0 or stop_loss <= 0 or take_profit <= 0:
+        raise RuntimeError("Order size, stop loss, and take profit must be positive.")
+
+    client = BinanceSpot(base_url, api_key, api_secret)
+    exchange_info = client.public_get("/api/v3/exchangeInfo", [("symbol", symbol)])
+    symbols = exchange_info.get("symbols", [])
+    if not symbols:
+        raise RuntimeError("Unknown or unavailable symbol: " + symbol)
+    symbol_info = symbols[0]
+    base_asset = symbol_info["baseAsset"]
+    lot_filter = next((item for item in symbol_info["filters"]
+                       if item["filterType"] == "LOT_SIZE"), None)
+    if lot_filter is None:
+        raise RuntimeError("Could not find LOT_SIZE filter for " + symbol)
+    step_size = lot_filter["stepSize"]
+    min_quantity = Decimal(lot_filter["minQty"])
+    min_notional = Decimal("0")
+    for item in symbol_info["filters"]:
+        if item["filterType"] in ("MIN_NOTIONAL", "NOTIONAL"):
+            min_notional = Decimal(item.get("minNotional", "0"))
+            break
+    if quote_amount < min_notional:
+        raise RuntimeError("QUOTE_ORDER_SIZE is below this symbol's minimum notional ({})".format(min_notional))
+
+    state = load_state(state_path)
+    while True:
+        klines = client.public_get("/api/v3/klines", [
+            ("symbol", symbol), ("interval", interval), ("limit", "200")
+        ])
+        if len(klines) < 60:
+            raise RuntimeError("Not enough candle history to calculate the strategy.")
+        # Binance includes the currently forming candle last; only use closed candles.
+        closed = klines[:-1]
+        closes = [float(candle[4]) for candle in closed]
+        fast = ema(closes, 20)
+        slow = ema(closes, 50)
+        rsi_values = rsi(closes, 14)
+        last_index = len(closed) - 1
+        previous_index = last_index - 1
+        candle_time = int(closed[last_index][0])
+        new_candle = candle_time > int(state.get("last_candle", 0))
+        crossed_up = (fast[previous_index] <= slow[previous_index] and
+                      fast[last_index] > slow[last_index])
+        crossed_down = (fast[previous_index] >= slow[previous_index] and
+                        fast[last_index] < slow[last_index])
+        buy_signal = crossed_up and 50.0 <= rsi_values[last_index] < 70.0
+        current_price = float(client.public_get(
+            "/api/v3/ticker/price", [("symbol", symbol)]
+        )["price"])
+
+        if state.get("in_position"):
+            entry_price = float(state.get("entry_price", 0.0))
+            stop_hit = entry_price > 0 and current_price <= entry_price * (1.0 - stop_loss)
+            target_hit = entry_price > 0 and current_price >= entry_price * (1.0 + take_profit)
+            if stop_hit or target_hit or (new_candle and crossed_down):
+                account = client.account()
+                free_balance = 0.0
+                for balance in account.get("balances", []):
+                    if balance.get("asset") == base_asset:
+                        free_balance = float(balance.get("free", "0"))
+                        break
+                sellable = min(free_balance, float(state.get("quantity", 0.0)))
+                sell_quantity = decimal_floor(sellable, step_size)
+                if sell_quantity < min_quantity:
+                    print("Exit signal, but available position is below the minimum sell quantity.")
+                else:
+                    order = client.market_sell(symbol, format_decimal(sell_quantity))
+                    print("SELL order accepted: {}".format(order.get("orderId", "unknown")))
+                    state.update({"in_position": False, "entry_price": 0.0, "quantity": 0.0})
+                    save_state(state_path, state)
+        elif new_candle and buy_signal:
+            order = client.market_buy(symbol, format(quote_amount, "f"))
+            executed = float(order.get("executedQty", "0"))
+            if executed <= 0:
+                raise RuntimeError("Buy order returned no executed quantity; check the Testnet account/order status.")
+            entry_price = average_fill_price(order, current_price)
+            state.update({"in_position": True, "entry_price": entry_price,
+                          "quantity": executed})
+            print("BUY order accepted: {} at average price {:.8f}".format(
+                order.get("orderId", "unknown"), entry_price
+            ))
+            save_state(state_path, state)
+        else:
+            print("No trade. Price {:.8f}; RSI {:.2f}; position {}".format(
+                current_price, rsi_values[last_index],
+                "open" if state.get("in_position") else "flat"
+            ))
+
+        if new_candle:
+            state["last_candle"] = candle_time
+            save_state(state_path, state)
+        if poll_seconds <= 0:
+            break
+        time.sleep(poll_seconds)
+
+
+def main():
+    try:
+        run_bot()
+    except Exception as error:
+        print("Bot stopped safely: {}".format(error))
+
+
+if __name__ == "__main__":
+    main()
